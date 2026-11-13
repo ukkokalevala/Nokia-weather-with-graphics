@@ -126,3 +126,30 @@ Y axis (0–5): selects one of 6 banks, each bank is 8 pixels tall.
 When you call setCursor(x, y), the controller jumps to column x and the top of bank y.
 
 Writing a byte fills 8 vertical pixels in that column (one bit per row within the bank).
+
+What happens when you write a character:
+
+setCursor(0, 1)  →  jumps here:
+                    ┌───┐
+                    │ ▼ │  ← X=0, top of Bank 1
+┌───────────────────┼───┼─────────────────────────────────────┐
+│  Bank 0           │   │                                     │
+├───────────────────┼───┼─────────────────────────────────────┤
+│  Bank 1           │ █ │                                     │ ← your byte fills
+│                   │ █ │                                     │   8 pixels vertically
+│                   │ █ │                                     │   in this column
+│                   │ █ │                                     │
+│                   │ █ │                                     │
+│                   │ █ │                                     │
+│                   │ █ │                                     │
+│                   │ █ │                                     │
+├───────────────────┼───┼─────────────────────────────────────┤
+│  Bank 2           │   │                                     │
+└───────────────────┴───┴─────────────────────────────────────┘
+                   X=0
+Common confusion:
+You might expect	Reality
+setCursor(0, 8) = next line down	  ❌ Y max is 5 (only 6 banks)
+Y moves one pixel	                  ❌ Y moves 8 pixels (one whole bank)
+Cursor = pixel coordinate	          ❌ Cursor = (column, bank) address
+So to place text on consecutive lines, you increment Y by 1, not by 8 — even though the text visually is 8 pixels tall. That's the "grid" trick: the hardware groups pixels into banks of 8, and the cursor only addresses banks, not individual rows.
