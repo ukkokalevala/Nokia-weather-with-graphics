@@ -59,6 +59,7 @@ Open-Meteo API (Free, no API key required)
 
 How it works:
 On boot, the ESP8266 connects to Wi-Fi and synchronizes its internal clock via NTP (using setenv to handle the SAST timezone). It then queries the Open-Meteo API for current weather conditions. The JSON response is parsed, and the Adafruit GFX library is used to draw scaled-down icons and text onto the Nokia display. The code is structured to be non-blocking, ensuring the Wi-Fi connection remains stable while the button and screen remain responsive. (Note: Because these LCDs are often mounted upside down, display.setRotation(2); is used in the setup to ensure the screen is right-side up!)
+
 Physical Screen: 84 pixels wide × 48 pixels tall
 ┌─────────────────────────────────────────────────────────────┐
 │                                                             │
