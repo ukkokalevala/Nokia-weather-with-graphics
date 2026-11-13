@@ -118,3 +118,11 @@ Physical Screen: 84 pixels wide × 48 pixels tall
 │          ████████████████████████████████████████████████  │
 └─────────────────────────────────────────────────────────────┘
   X=0                                                       X=83
+Key points illustrated:
+X axis (0–83): moves horizontally, one pixel at a time.
+
+Y axis (0–5): selects one of 6 banks, each bank is 8 pixels tall.
+
+When you call setCursor(x, y), the controller jumps to column x and the top of bank y.
+
+Writing a byte fills 8 vertical pixels in that column (one bit per row within the bank).
