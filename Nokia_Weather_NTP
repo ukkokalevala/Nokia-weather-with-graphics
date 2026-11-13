@@ -1,0 +1,319 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClient.h>
+#include <ArduinoJson.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_PCD8544.h>
+#include <time.h>
+
+// ---------- PIN DEFINITIONS (Your Wiring) ----------
+#define PIN_RST D2
+#define PIN_CS  D1
+#define PIN_DC  D6
+#define PIN_DIN D7
+#define PIN_CLK D5
+#define BTN_PIN D3  // Button on D3 (GPIO0) - perfectly safe on Wemos D1
+
+// ---------- CONFIG ----------
+const char* WIFI_SSID     = "YOUR_SSID";
+const char* WIFI_PASSWORD = "YOUR_PASSWORD";
+
+// Cape Town Coordinates
+const float LAT = -33.9252;
+const float LON = 18.4238;
+const char* TZ_STR = "SAST-2"; // South Africa Standard Time
+
+// ---------- OBJECTS ----------
+// Hardware SPI: CLK=D5, DIN=D7. Software SPI: RST, CS, DC
+Adafruit_PCD8544 display = Adafruit_PCD8544(PIN_CLK, PIN_DIN, PIN_DC, PIN_CS, PIN_RST);
+
+// ---------- STATE ----------
+struct NetWeather { 
+  float temp = NAN; 
+  float feelsLike = NAN;
+  float windSpeed = NAN;
+  int code = -1; 
+  bool isDay = true; 
+  bool valid = false; 
+} netWeather;
+
+uint8_t page = 0;
+const uint8_t PAGE_COUNT = 2;
+unsigned long lastWeatherFetch = 0;
+const unsigned long WEATHER_INTERVAL = 600000UL; // 10 mins
+
+// ---------- ICONS (Scaled for 84x48 screen) ----------
+// Center X, Center Y, Radius
+void drawSun(int cx, int cy, int r) {
+  display.fillCircle(cx, cy, r, BLACK);
+  for (int a = 0; a < 360; a += 45) {
+    float rad = a * DEG_TO_RAD;
+    int x1 = cx + cos(rad) * (r + 1);
+    int y1 = cy + sin(rad) * (r + 1);
+    int x2 = cx + cos(rad) * (r + 3);
+    int y2 = cy + sin(rad) * (r + 3);
+    display.drawLine(x1, y1, x2, y2, BLACK);
+  }
+}
+
+void drawCloud(int cx, int cy) {
+  display.fillCircle(cx - 4, cy + 1, 4, BLACK);
+  display.fillCircle(cx + 1, cy - 2, 5, BLACK);
+  display.fillCircle(cx + 6, cy + 1, 4, BLACK);
+  display.fillRect(cx - 4, cy + 1, 10, 4, BLACK);
+}
+
+void drawRain(int cx, int cy) {
+  drawCloud(cx, cy - 3);
+  for (int i = 0; i < 3; i++) {
+    int x = cx - 5 + i * 5;
+    display.drawLine(x, cy + 5, x - 1, cy + 8, BLACK);
+  }
+}
+
+void drawSnow(int cx, int cy) {
+  drawCloud(cx, cy - 3);
+  for (int i = 0; i < 3; i++) {
+    int x = cx - 5 + i * 5;
+    display.drawPixel(x, cy + 7, BLACK);
+    display.drawPixel(x - 1, cy + 8, BLACK);
+    display.drawPixel(x + 1, cy + 8, BLACK);
+  }
+}
+
+void drawThunder(int cx, int cy) {
+  drawCloud(cx, cy - 3);
+  display.drawLine(cx, cy + 4, cx - 2, cy + 7, BLACK);
+  display.drawLine(cx - 2, cy + 7, cx + 1, cy + 7, BLACK);
+  display.drawLine(cx + 1, cy + 7, cx - 1, cy + 10, BLACK);
+}
+
+void drawMist(int cx, int cy) {
+  for (int i = 0; i < 3; i++) {
+    display.drawLine(cx - 6, cy - 2 + i * 3, cx + 6, cy - 2 + i * 3, BLACK);
+  }
+}
+
+void drawWeatherByCode(int code, int cx, int cy, bool isDay) {
+  if (code == 0) {
+    if (isDay) drawSun(cx, cy, 4);
+    else { 
+      // Simple Moon
+      display.fillCircle(cx, cy, 5, BLACK); 
+      display.fillCircle(cx + 2, cy - 2, 4, WHITE); 
+    }
+  } else if (code <= 3) { drawSun(cx - 3, cy - 3, 3); drawCloud(cx + 2, cy + 2); }
+  else if (code == 45 || code == 48) drawMist(cx, cy);
+  else if (code >= 51 && code <= 67) drawRain(cx, cy);
+  else if (code >= 71 && code <= 77) drawSnow(cx, cy);
+  else if (code >= 80 && code <= 82) drawRain(cx, cy);
+  else if (code >= 85 && code <= 86) drawSnow(cx, cy);
+  else if (code >= 95) drawThunder(cx, cy);
+  else drawCloud(cx, cy);
+}
+
+const char* getWeatherText(int code) {
+  if (code == 0) return "Clear";
+  if (code <= 3) return "Pt Cloudy";
+  if (code == 45 || code == 48) return "Foggy";
+  if (code >= 51 && code <= 55) return "Drizzle";
+  if (code >= 61 && code <= 65) return "Rain";
+  if (code >= 71 && code <= 77) return "Snow";
+  if (code >= 80 && code <= 82) return "Showers";
+  if (code >= 95) return "T-Storm";
+  return "Cloudy";
+}
+
+// ---------- WEATHER API ----------
+void fetchWeather() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  
+  WiFiClient client;
+  HTTPClient http;
+  String url = "http://api.open-meteo.com/v1/forecast?latitude=" + String(LAT,4) +
+               "&longitude=" + String(LON,4) +
+               "&current=temperature_2m,apparent_temperature,weather_code,is_day,wind_speed_10m&timezone=auto";
+               
+  http.begin(client, url);
+  int code = http.GET();
+  
+  if (code == 200) {
+    String payload = http.getString();
+    StaticJsonDocument<1024> doc;
+    if (!deserializeJson(doc, payload)) {
+      netWeather.temp      = doc["current"]["temperature_2m"] | NAN;
+      netWeather.feelsLike = doc["current"]["apparent_temperature"] | NAN;
+      netWeather.windSpeed = doc["current"]["wind_speed_10m"] | NAN;
+      netWeather.code      = doc["current"]["weather_code"] | -1;
+      netWeather.isDay     = (doc["current"]["is_day"] | 1) == 1;
+      netWeather.valid     = !isnan(netWeather.temp);
+    }
+  }
+  http.end();
+  lastWeatherFetch = millis();
+}
+
+// ---------- WIFI / TIME ----------
+void connectWiFi() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  display.print("Connecting WiFi...");
+  display.display();
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+    delay(300);
+  }
+}
+
+void syncTime() {
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov"); // UTC time
+  
+  // Set timezone to SAST (UTC+2)
+  // Note: ESP8266 handles timezone differently than ESP32
+  setenv("TZ", TZ_STR, 1);
+  tzset();
+  
+  struct tm tm_now;
+  for (int i = 0; i < 20; i++) {
+    if (getLocalTime(&tm_now, 1000)) return;
+  }
+}
+
+// ---------- PAGES ----------
+void drawWeatherPage() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(BLACK);
+  
+  // Title
+  display.setCursor(0, 0);
+  display.print("CAPE TOWN");
+  display.drawLine(0, 9, 84, 9, BLACK);
+  
+  if (!netWeather.valid) {
+    display.setCursor(0, 20);
+    display.print("No data...");
+    display.display();
+    return;
+  }
+  
+  // Big Temp
+  display.setTextSize(2);
+  display.setCursor(0, 12);
+  char buf[16];
+  snprintf(buf, 16, "%.1fC", netWeather.temp);
+  display.print(buf);
+  
+  // Icon on the right
+  drawWeatherByCode(netWeather.code, 70, 20, netWeather.isDay);
+  
+  // Details
+  display.setTextSize(1);
+  display.setCursor(0, 32);
+  display.print(getWeatherText(netWeather.code));
+  
+  display.setCursor(0, 41);
+  snprintf(buf, 16, "F:%.0fC W:%.0f", netWeather.feelsLike, netWeather.windSpeed);
+  display.print(buf);
+  
+  display.display();
+}
+
+void drawClockPage() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(BLACK);
+  
+  // Title
+  display.setCursor(0, 0);
+  display.print("CAPE TOWN");
+  display.drawLine(0, 9, 84, 9, BLACK);
+  
+  struct tm tm_now;
+  if (!getLocalTime(&tm_now, 10)) {
+    display.setCursor(0, 20);
+    display.print("Syncing...");
+    display.display();
+    return;
+  }
+  
+  char tb[16];
+  
+  // Big Time
+  display.setTextSize(2);
+  strftime(tb, 16, "%H:%M", &tm_now);
+  display.setCursor(0, 14);
+  display.print(tb);
+  
+  // Date
+  display.setTextSize(1);
+  strftime(tb, 16, "%d %b %Y", &tm_now); // %a Fri does not fit
+  display.setCursor(0, 40);
+  display.print(tb);
+  
+  display.display();
+}
+
+void drawPage() {
+  if (page == 0) drawWeatherPage();
+  else drawClockPage();
+}
+
+// ---------- BUTTON ----------
+void handleButton() {
+  static bool lastState = HIGH;
+  static unsigned long lastChange = 0;
+  bool state = digitalRead(BTN_PIN);
+  
+  if (state != lastState && millis() - lastChange > 50) {
+    lastChange = millis();
+    if (state == LOW) { 
+      page = (page + 1) % PAGE_COUNT; 
+      drawPage(); 
+    }
+    lastState = state;
+  }
+}
+
+// ---------- SETUP / LOOP ----------
+void setup() {
+  Serial.begin(115200);
+  pinMode(BTN_PIN, INPUT_PULLUP);
+  
+  // Initialize Display
+  display.begin();
+  display.setRotation(2);
+  display.setContrast(40); // Adjust contrast (0-100) if screen is too dark/light
+  display.clearDisplay();
+  display.display();
+
+  connectWiFi();
+  if (WiFi.status() == WL_CONNECTED) {
+    syncTime();
+    fetchWeather();
+  }
+  
+  drawPage();
+}
+
+void loop() {
+  handleButton();
+  
+  if (millis() - lastWeatherFetch > WEATHER_INTERVAL) {
+    fetchWeather();
+    if (page == 0) drawPage();
+  }
+  
+  static unsigned long lastDraw = 0;
+  if (millis() - lastDraw > 1000) {
+    lastDraw = millis();
+    drawPage();
+  }
+  
+  delay(10);
+}
